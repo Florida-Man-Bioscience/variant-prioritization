@@ -23,5 +23,6 @@ uploads/
 .DS_Store
 Thumbs.db
 
-# Git
-.gitignore
+# Package/Env management
+*.lock
+.env
