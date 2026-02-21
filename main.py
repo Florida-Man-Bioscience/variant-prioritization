@@ -442,28 +442,42 @@ def get_gnomad_frequency(vep_result):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_vep_api(variants, progress_callback=None):
-    """Annotate a list of coordinate-resolved variants via the VEP REST API."""
+    """Annotate a list of coordinate-resolved variants via the VEP REST API in batches."""
     annotated = []
-    for i, v in enumerate(variants):
-        chrom = str(v["chrom"]).replace("chr", "")
-        region_string = f"{chrom}:{v['pos']}-{v['pos']}:1/{v['alt']}"
+    batch_size = 200
+    
+    for i in range(0, len(variants), batch_size):
+        batch = variants[i : i + batch_size]
+        
+        # Prepare region strings for VEP batch request
+        # Format: "1:2307100-2307100:1/T"
+        region_strings = []
+        for v in batch:
+            chrom = str(v["chrom"]).replace("chr", "")
+            region_string = f"{chrom}:{v['pos']}-{v['pos']}:1/{v['alt']}"
+            region_strings.append(region_string)
+
         response = requests.post(
             "https://rest.ensembl.org/vep/human/region",
             headers={"Content-Type": "application/json"},
-            json={"variants": [region_string]},
+            json={"variants": region_strings},
         )
+        
         if response.status_code != 200:
             raise Exception(
-                f"VEP API failed for variant {region_string}: {response.text}"
+                f"VEP API failed for batch starting at {i}: {response.text}"
             )
-        result = response.json()
-        if result:
+            
+        results = response.json()
+        
+        # VEP returns results in the same order as requested
+        for j, result in enumerate(results):
             # Carry the original rsID through so we can use it for N8N
-            result[0]["_original_rsid"] = v.get("rsid")
-            annotated.append(result[0])
+            result["_original_rsid"] = batch[j].get("rsid")
+            annotated.append(result)
 
         if progress_callback:
-            progress_callback(i + 1, len(variants))
+            progress_callback(min(i + batch_size, len(variants)), len(variants))
 
     return annotated
 
@@ -494,6 +508,7 @@ def prioritize_variant(vep_result):
     """
     score = 0
     reasons = []
+    score_breakdown = {"clinvar": 0, "consequence": 0, "frequency": 0, "other": 0}
 
     # Extract consequence terms and gene symbols
     consequences = set()
@@ -508,52 +523,66 @@ def prioritize_variant(vep_result):
 
     # ---------- 1. ClinVar ----------
     if clinvar == "pathogenic":
-        score += 1000
+        score += 400
+        score_breakdown["clinvar"] = 400
         reasons.append("⚠️ ClinVar: PATHOGENIC")
     elif clinvar == "likely_pathogenic":
-        score += 500
+        score += 200
+        score_breakdown["clinvar"] = 200
         reasons.append("⚠️ ClinVar: Likely Pathogenic")
     elif clinvar == "benign":
         score = 1
+        score_breakdown["clinvar"] = 1
         reasons.append("✅ ClinVar: Benign")
-        return _build_result(vep_result, genes, clinvar, gnomad_af, score, "low", reasons)
+        return _build_result(vep_result, genes, clinvar, gnomad_af, score, "low", reasons, score_breakdown)
     elif clinvar == "likely_benign":
         score = 5
+        score_breakdown["clinvar"] = 5
         reasons.append("✅ ClinVar: Likely Benign")
     elif clinvar == "uncertain_significance":
-        score += 50
+        score += 20
+        score_breakdown["clinvar"] = 20
         reasons.append("❓ ClinVar: VUS (uncertain)")
 
     # ---------- 2. Functional consequence ----------
     if consequences & HIGH_IMPACT:
-        score += 100
+        score += 40
+        score_breakdown["consequence"] = 40
         reasons.append(f"High impact: {', '.join(consequences & HIGH_IMPACT)}")
     elif consequences & MODERATE_IMPACT:
-        score += 50
+        score += 20
+        score_breakdown["consequence"] = 20
         reasons.append(f"Moderate impact: {', '.join(consequences & MODERATE_IMPACT)}")
     elif consequences & LOW_IMPACT:
-        score += 5
+        score += 2
+        score_breakdown["consequence"] = 2
         reasons.append(f"Low impact: {', '.join(consequences & LOW_IMPACT)}")
     else:
         score += 1
+        score_breakdown["consequence"] = 1
         reasons.append("No coding consequence")
 
     # ---------- 3. Population frequency ----------
     if gnomad_af is not None:
         if gnomad_af == 0:
-            score += 30
+            score += 12
+            score_breakdown["frequency"] = 12
             reasons.append("Absent in gnomAD (AF=0)")
         elif gnomad_af < 0.0001:
-            score += 20
+            score += 8
+            score_breakdown["frequency"] = 8
             reasons.append(f"Ultra-rare (AF={gnomad_af:.6f})")
         elif gnomad_af < 0.001:
-            score += 10
+            score += 4
+            score_breakdown["frequency"] = 4
             reasons.append(f"Very rare (AF={gnomad_af:.4f})")
         elif gnomad_af < 0.01:
-            score += 5
+            score += 2
+            score_breakdown["frequency"] = 2
             reasons.append(f"Rare (AF={gnomad_af:.3f})")
         else:
-            score -= 20
+            score -= 8
+            score_breakdown["frequency"] = -8
             reasons.append(f"Common variant (AF={gnomad_af:.2%})")
     else:
         reasons.append("No frequency data")
@@ -562,23 +591,24 @@ def prioritize_variant(vep_result):
     if genes:
         reasons.append(f"Gene(s): {', '.join(sorted(genes))}")
     else:
-        score -= 10
+        score -= 4
+        score_breakdown["other"] = -4
         reasons.append("Intergenic (no gene)")
 
     # ---------- Tiering ----------
-    if score >= 500:
+    if score >= 200:
         tier = "critical"
-    elif score >= 100:
+    elif score >= 40:
         tier = "high"
-    elif score >= 30:
+    elif score >= 12:
         tier = "medium"
     else:
         tier = "low"
 
-    return _build_result(vep_result, genes, clinvar, gnomad_af, score, tier, reasons)
+    return _build_result(vep_result, genes, clinvar, gnomad_af, score, tier, reasons, score_breakdown)
 
 
-def _build_result(vep_result, genes, clinvar, gnomad_af, score, tier, reasons):
+def _build_result(vep_result, genes, clinvar, gnomad_af, score, tier, reasons, score_breakdown):
     """Helper to build a standardised result dict."""
     return {
         "variant_id": vep_result.get("id"),
@@ -591,6 +621,7 @@ def _build_result(vep_result, genes, clinvar, gnomad_af, score, tier, reasons):
         "score": score,
         "tier": tier,
         "reasons": reasons,
+        "score_breakdown": score_breakdown,
     }
 
 
@@ -759,9 +790,22 @@ def render_variant_card(variant, n8n_enabled):
     tier_emoji = TIER_COLORS.get(variant["tier"], "⚪")
     tier_color = TIER_CSS.get(variant["tier"], "#888")
 
+    # Guidance based on tier
+    guidance_map = {
+        "critical": "⚠️ **Guidance:** Consider discussing this finding with a genetic counselor.",
+        "high": "💡 **Guidance:** Worth reviewing with your healthcare provider.",
+        "medium": "📝 **Guidance:** Monitor and mention at your next checkup.",
+        "low": "✅ **Guidance:** No action needed based on current evidence.",
+    }
+    guidance_text = guidance_map.get(variant["tier"], "")
+
+    # Breakdown string
+    bd = variant.get("score_breakdown", {})
+    breakdown_str = f" (ClinVar: {bd.get('clinvar', 0)}, Cons: {bd.get('consequence', 0)}, Freq: {bd.get('frequency', 0)})"
+
     label = (
         f"{tier_emoji} **{variant['variant_id'] or variant['location']}** "
-        f"— Score {variant['score']}  "
+        f"— Score {variant['score']}{breakdown_str} "
         f"(`{variant['tier'].upper()}`)"
     )
 
@@ -782,6 +826,9 @@ def render_variant_card(variant, n8n_enabled):
         st.markdown("**Scoring Reasons:**")
         for r in variant["reasons"]:
             st.markdown(f"- {r}")
+        
+        if guidance_text:
+            st.info(guidance_text)
 
         # ── N8N Analysis ──
         if variant.get("rsid"):
